@@ -8,7 +8,7 @@ from pyspark.sql.functions import array_contains
 
 def random_text_classifier(input_loc, output_loc):
     """
-    This is a dummy function to that mocks the following steps:
+    This is a dummy function that mocks the following steps:
 
         1. clean input data (tokenization, remove stop words)
         2. use a pre-trained model to make prediction 

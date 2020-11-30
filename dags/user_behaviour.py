@@ -13,34 +13,26 @@ from airflow.operators.postgres_operator import PostgresOperator
 from airflow.contrib.operators.emr_add_steps_operator import EmrAddStepsOperator
 from airflow.contrib.sensors.emr_step_sensor import EmrStepSensor
 
+from airflow.hooks.postgres_hook import PostgresHook
+import psycopg2
+
 # config
 # Local
 unload_user_purchase ='./scripts/sql/filter_unload_user_purchase.sql'
 temp_filtered_user_purchase = '/temp/temp_filtered_user_purchase.csv'
-movie_review_local = '/data/movie/review/movie_review.csv'
+movie_review_local = '/data/movie_review/movie_review.csv'
 movie_clean_emr_steps = './dags/scripts/emr/clean_movie_review.json'
 movie_text_classification_script = './dags/scripts/spark/random_text_classification.py'
 
 # remote config
 BUCKET_NAME = 'batch-project1'
-EMR_ID = 'j-35J66P28T7YD5'
+EMR_ID = 'j-2D6WDQALOTNMS'
 temp_filtered_user_purchase_key= 'user_purchase/stage/{{ ds }}/temp_filtered_user_purchase.csv'
 movie_review_load = 'movie_review/load/movie.csv'
 movie_review_load_folder = 'movie_review/load/'
 movie_review_stage = 'movie_review/stage/'
 text_classifier_script = 'scripts/random_text_classifier.py'
-
-default_args = {
-    "owner": "airflow",
-    "depends_on_past": True,
-    'wait_for_downstream': True,
-    "start_date": datetime(2010, 12, 1), # we start at this date to be consistent with the dataset we have and airflow will catchup
-    "email": ["airflow@airflow.com"],
-    "email_on_failure": False,
-    "email_on_retry": False,
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5)
-}
+get_user_behaviour = 'scripts/sql/get_user_behavior_metrics.sql'
 
 # helper functions
 def _local_to_s3(filename, key, bucket_name=BUCKET_NAME):
@@ -54,13 +46,28 @@ def remove_local_file(filelocation):
     else:
         logging.info(f'File {filelocation} not found')
 
-def _local_to_s3(filename, key, bucket_name=BUCKET_NAME):
-    s3 = S3Hook()
-    s3.load_file(filename=filename, bucket_name=bucket_name,
-                 replace=True, key=key)
+def run_redshift_external_query(qry):
+    rs_hook = PostgresHook(postgres_conn_id='redshift')
+    rs_conn = rs_hook.get_conn()
+    rs_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    rs_cursor = rs_conn.cursor()
+    rs_cursor.execute(qry)
+    rs_cursor.close()
+    rs_conn.commit()
 
-# DAG
+default_args = {
+    "owner": "airflow",
+    "depends_on_past": True,
+    'wait_for_downstream': True,
+    "start_date": datetime(2010, 12, 1), # we start at this date to be consistent with the dataset we have and airflow will catchup
+    "email": ["airflow@airflow.com"],
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5)
+}
 
+# DAG tasks
 dag = DAG("user_behaviour", default_args=default_args,
           schedule_interval="0 0 * * *", max_active_runs=1)
 
@@ -95,14 +102,14 @@ remove_local_user_purchase_file = PythonOperator(
     },
 )
 
-movie_review_to_s3 = PythonOperator(
+movie_review_to_s3_stage = PythonOperator(
     dag=dag,
-    task_id='user_purchase_to_s3_stage',
+    task_id='movie_review_to_s3_stage',
     python_callable=_local_to_s3,
     op_kwargs={
         'filename': movie_review_local,
-        'key': movie_review_load
-    }
+        'key': movie_review_load,
+    },
 )
 
 move_emr_script_to_s3 = PythonOperator(
@@ -136,16 +143,6 @@ add_emr_steps = EmrAddStepsOperator(
 
 last_step = len(emr_steps) - 1
 
-movie_review_to_s3_stage = PythonOperator(
-    dag=dag,
-    task_id='movie_review_to_s3_stage',
-    python_callable=_local_to_s3,
-    op_kwargs={
-        'filename': movie_review_local,
-        'key': movie_review_load,
-    },
-)
-
 # sensing if the last step is complete
 clean_movie_review_data = EmrStepSensor(
     dag=dag,
@@ -156,5 +153,23 @@ clean_movie_review_data = EmrStepSensor(
     depends_on_past=True
 )
 
-pg_unload >> user_purchase_to_s3_stage >> remove_local_user_purchase_file >> end_of_data_pipeline
+user_purchase_to_rs_stage = PythonOperator(
+    dag=dag,
+    task_id='user_purchase_to_rs_stage',
+    python_callable=run_redshift_external_query,
+    op_kwargs={
+        'qry': "alter table spectrum.user_purchase_staging add partition(insert_date='{{ ds }}') \
+            location 's3://batch-project1/user_purchase/stage/{{ ds }}'",    # {{ ds }} gets inbuilt macros to get execution date
+    }, 
+)
+
+get_user_behaviour = PostgresOperator(
+    dag=dag,
+    task_id='get_user_behaviour',
+    sql=get_user_behaviour,
+    postgres_conn_id='redshift'
+)
+
+pg_unload >> user_purchase_to_s3_stage >> remove_local_user_purchase_file >> user_purchase_to_rs_stage
 [movie_review_to_s3_stage, move_emr_script_to_s3] >> add_emr_steps >> clean_movie_review_data
+[user_purchase_to_rs_stage, clean_movie_review_data] >> get_user_behaviour >> end_of_data_pipeline
