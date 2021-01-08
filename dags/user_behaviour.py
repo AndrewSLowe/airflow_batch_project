@@ -26,7 +26,7 @@ movie_text_classification_script = './dags/scripts/spark/random_text_classificat
 
 # remote config
 BUCKET_NAME = 'batch-project1'
-EMR_ID = 'j-2D6WDQALOTNMS'
+EMR_ID = 'j-5BF5U0TMXKFI'
 temp_filtered_user_purchase_key= 'user_purchase/stage/{{ ds }}/temp_filtered_user_purchase.csv'
 movie_review_load = 'movie_review/load/movie.csv'
 movie_review_load_folder = 'movie_review/load/'
